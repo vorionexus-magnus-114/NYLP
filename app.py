@@ -627,6 +627,13 @@ def dashboard_tab():
         return
 
     shown = visible[: st.session_state.result_limit]
+    if len(visible) > len(shown):
+        st.caption(
+            f"Showing {len(shown)} of {len(visible)}. "
+            + ("'Show more' loads another 24."
+               if not st.session_state.show_excluded
+               else "'Show more' also reveals the records you are not eligible for.")
+        )
     for index, item in enumerate(shown):
         render_card(item, key_prefix=f"dash{index}")
 
