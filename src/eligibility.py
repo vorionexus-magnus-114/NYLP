@@ -16,6 +16,8 @@ Deterministic, rule-based and offline. Design rules:
 import re
 from datetime import date, datetime
 
+from src.criteria import enrich_record, match_field
+
 
 # --------------------------------------------------------------------------- #
 # Generic helpers
@@ -91,6 +93,9 @@ _EDU_ALIASES = {
     "fsc": "intermediate", "ics": "intermediate",
     "matric": "matric", "matriculation": "matric", "ssc": "matric", "10th": "matric",
     "o level": "matric", "o levels": "matric",
+    "vocational": "vocational", "dae": "vocational", "diploma": "vocational",
+    "diploma of associate engineering": "vocational", "associate": "vocational",
+    "associate degree": "vocational", "technical diploma": "vocational",
     # Deliberately NOT aliased (ambiguous): "graduate", "postgraduate", "post graduate",
     # "pg" (may or may not include PhD; "graduate" often means "holds a bachelor").
 }
@@ -168,6 +173,13 @@ def _canon_from_table(value, table):
     n2 = _strip_parenthetical(n)
     if n2 in table:
         return table[n2], True
+    # Labels such as "Undergraduate / Bachelors" or "Postgraduate / Masters"
+    # describe one level; accept them when every recognised part agrees.
+    parts = [p.strip() for p in re.split(r"[/,;|]", n2) if p.strip()]
+    if len(parts) > 1:
+        found = {table[p] for p in parts if p in table}
+        if len(found) == 1:
+            return found.pop(), True
     return n2, False
 
 
@@ -415,11 +427,14 @@ def _parse_date(value):
 # --------------------------------------------------------------------------- #
 
 _OPEN_STATUSES = {"open", "active", "available", "ongoing", "applications open",
-                  "accepting applications"}
+                  "accepting applications", "rolling", "open rolling",
+                  "rolling applications", "open and rolling"}
 _CLOSED_STATUSES = {"closed", "expired", "inactive", "disabled", "archived",
                     "applications closed", "cancelled", "canceled", "discontinued",
                     "suspended"}
-_NOT_YET_OPEN_STATUSES = {"upcoming", "coming soon", "not yet open", "opening soon"}
+_NOT_YET_OPEN_STATUSES = {"upcoming", "coming soon", "not yet open", "opening soon",
+                          "not announced", "not announced yet", "unannounced",
+                          "not yet announced"}
 
 
 def _check_set(label, sch_raw, prof_raw, canon, wildcards, passes, fails, missing,
@@ -504,26 +519,103 @@ def _check_domicile(sch_raw, prof_raw, passes, fails, missing):
 def _check_field(sch_raw, prof_raw, passes, fails, missing):
     if _is_empty(sch_raw):
         return
-    if _is_empty(prof_raw):
-        missing.append("field_of_study is required but not provided in profile")
-        return
-    sch_vals = [_clean_text(v) for v in _parse_list(sch_raw)]
-    prof_vals = [_clean_text(v) for v in _parse_list(prof_raw)]
-    if any(v in _WILDCARDS["field"] for v in sch_vals):
-        passes.append(f"Field of study has no restriction ({sch_raw})")
-        return
-    if set(sch_vals) & set(prof_vals):
+    verdict = match_field(sch_raw, prof_raw)
+    if verdict == "pass":
         passes.append(f"Field of study matches: {prof_raw}")
+    elif verdict == "fail":
+        fails.append(
+            f"Field of study requirement not met: scholarship is for '{sch_raw}', profile has '{prof_raw}'"
+        )
+    else:
+        if _is_empty(prof_raw):
+            missing.append("field_of_study is required but not provided in profile")
+        else:
+            missing.append(
+                f"field_of_study could not be confirmed: scholarship says '{sch_raw}', profile says '{prof_raw}'"
+            )
+
+
+def _is_pakistan(value):
+    return _canon_destination(value)[0] == "pakistan"
+
+
+def _check_destination(sch_raw, prof_raw, passes, fails, missing):
+    """
+    Compare the student's destination preference with the scholarship's country.
+
+    Profile semantics: ``Pakistan`` / ``Abroad`` / ``Both`` / ``None`` (any).
+    A scholarship destination may be a country, a comma/semicolon list, or a
+    non-country scope such as ``International``. Wildcards mean unrestricted.
+    """
+    if _is_empty(prof_raw):
         return
-    # Partial overlap ("engineering" vs "mechanical engineering") is uncertain, not a match.
-    for a in sch_vals:
-        for b in prof_vals:
-            if a and b and (re.search(rf"\b{re.escape(a)}\b", b) or re.search(rf"\b{re.escape(b)}\b", a)):
-                missing.append(
-                    f"field_of_study could not be confirmed: scholarship says '{sch_raw}', profile says '{prof_raw}'"
-                )
-                return
-    fails.append(f"Field of study requirement not met: required {sch_raw}, profile has {prof_raw}")
+    pref = _clean_text(prof_raw)
+    if pref in ("", "both", "any", "all", "anywhere"):
+        return
+    wants_abroad = pref in ("abroad", "international", "foreign", "overseas")
+    wants_pakistan = pref in ("pakistan", "pakistani", "pak")
+    if not wants_abroad and not wants_pakistan:
+        return
+
+    if _is_empty(sch_raw):
+        missing.append(
+            "Study destination is not stated for this scholarship; cannot confirm it "
+            f"matches your preference ({prof_raw})"
+        )
+        return
+
+    raw_norm = _clean_text(sch_raw)
+    if any(w in raw_norm for w in _WILDCARDS["destination"]):
+        passes.append(f"Destination has no restriction ({sch_raw})")
+        return
+    if raw_norm in ("international", "overseas", "foreign", "abroad"):
+        countries = {"abroad"}
+    else:
+        countries = {c for c, _ in (_canon_destination(v) for v in _parse_list(sch_raw))}
+
+    if not countries:
+        missing.append(f"Destination '{sch_raw}' could not be interpreted")
+        return
+
+    only_pakistan = countries == {"pakistan"}
+    has_abroad = any(c != "pakistan" for c in countries)
+
+    if wants_pakistan:
+        if only_pakistan:
+            passes.append(f"Destination matches: {sch_raw}")
+        elif has_abroad and "pakistan" not in countries:
+            fails.append(f"Scholarship is for study abroad ({sch_raw}); your destination is Pakistan")
+        elif has_abroad:
+            passes.append(f"Scholarship includes study in Pakistan ({sch_raw})")
+        else:
+            missing.append(f"Destination '{sch_raw}' could not be interpreted")
+    else:  # wants_abroad
+        if has_abroad:
+            passes.append(f"Destination matches: {sch_raw}")
+        elif only_pakistan:
+            fails.append(f"Scholarship is for study in Pakistan ({sch_raw}); your destination is Abroad")
+        else:
+            missing.append(f"Destination '{sch_raw}' could not be interpreted")
+
+
+def _check_gender(sch_gender, prof_gender, passes, fails, missing):
+    sch = _clean_text(sch_gender)
+    if not sch:
+        return
+    if _is_empty(prof_gender):
+        missing.append(f"gender is required but not provided in profile (scholarship is for {sch_gender})")
+        return
+    prof = _clean_text(prof_gender)
+    sch_tokens = set(re.findall(r"[a-z]+", sch))
+    prof_tokens = set(re.findall(r"[a-z]+", prof))
+    if (sch_tokens & {"female", "women", "woman", "girl"}) and \
+            (prof_tokens & {"female", "women", "woman", "girl"}):
+        passes.append(f"Gender matches: {sch_gender}")
+    elif (sch_tokens & {"male", "men", "man", "boy"}) and \
+            (prof_tokens & {"male", "men", "man", "boy"}):
+        passes.append(f"Gender matches: {sch_gender}")
+    else:
+        fails.append(f"Gender requirement not met: scholarship is for {sch_gender}, profile says {prof_gender}")
 
 
 # --------------------------------------------------------------------------- #
@@ -541,21 +633,131 @@ def _as_dict(obj):
         return {}
 
 
+def get_value(source, keys):
+    """Return the first present key (case/space-insensitive) from ``source``."""
+    for key in keys:
+        if key in source:
+            return source[key]
+    lowered = {_normalize(sk): sk for sk in source.keys()}
+    for key in keys:
+        if _normalize(key) in lowered:
+            return source[lowered[_normalize(key)]]
+    return None
+
+
+def _eval_grade_requirement(scholarship, profile, criteria_passes, hard_fails, missing):
+    """Evaluate percentage / CGPA requirements, honouring OR alternatives."""
+    sch_marks = get_value(scholarship, ["minimum_marks", "min_marks", "minimum_marks_required"])
+    sch_cgpa = get_value(scholarship, ["minimum_cgpa", "min_cgpa", "minimum_gpa"])
+    if _is_empty(sch_marks) and _is_empty(sch_cgpa):
+        return
+
+    logic = _clean_text(scholarship.get("grade_logic")) or ("or" if not _is_empty(sch_marks)
+                                                           and not _is_empty(sch_cgpa) else "and")
+    prof_marks = get_value(profile, ["marks", "percentage", "marks_percentage"])
+    prof_cgpa = get_value(profile, ["cgpa", "gpa"])
+
+    need_marks = need_cgpa = None
+    if not _is_empty(sch_marks):
+        need_marks, note = _parse_percentage(sch_marks)
+        if need_marks is None:
+            missing.append(f"scholarship minimum_marks criterion malformed or invalid: {note}")
+    if not _is_empty(sch_cgpa):
+        need_cgpa, note = _parse_cgpa(sch_cgpa)
+        if need_cgpa is None:
+            missing.append(f"scholarship minimum_cgpa criterion malformed or invalid: {note}")
+
+    have_marks = have_cgpa = None
+    marks_note = cgpa_note = None
+    if not _is_empty(prof_marks):
+        have_marks, marks_note = _parse_percentage(prof_marks)
+    if not _is_empty(prof_cgpa):
+        have_cgpa, cgpa_note = _parse_cgpa(prof_cgpa)
+
+    def mark_result():
+        if need_marks is None:
+            return "unknown"
+        if _is_empty(prof_marks):
+            return "missing"
+        if have_marks is None:
+            return "unknown"
+        return "pass" if have_marks >= need_marks else "fail"
+
+    def cgpa_result():
+        if need_cgpa is None:
+            return "unknown"
+        if _is_empty(prof_cgpa):
+            return "missing"
+        if have_cgpa is None:
+            return "unknown"
+        return "pass" if have_cgpa >= need_cgpa else "fail"
+
+    if logic == "or" and need_marks is not None and need_cgpa is not None:
+        results = [mark_result(), cgpa_result()]
+        if "pass" in results:
+            parts = []
+            if have_marks is not None and need_marks is not None and have_marks >= need_marks:
+                parts.append(f"marks {have_marks:g}%")
+            if have_cgpa is not None and need_cgpa is not None and have_cgpa >= need_cgpa:
+                parts.append(f"CGPA {have_cgpa:g}")
+            criteria_passes.append(
+                f"Grade requirement met ({', '.join(parts)}; required {need_marks:g}% or CGPA {need_cgpa:g})"
+            )
+        elif all(r == "fail" for r in results):
+            hard_fails.append(
+                f"Grade requirement not met: required {need_marks:g}% or CGPA {need_cgpa:g}; "
+                f"profile has marks {prof_marks if have_marks is not None else 'invalid'} and "
+                f"CGPA {prof_cgpa if have_cgpa is not None else 'invalid'}"
+            )
+        else:
+            if "missing" in results:
+                if mark_result() == "missing":
+                    missing.append("academic marks (percentage) are not provided in profile")
+                if cgpa_result() == "missing":
+                    missing.append("CGPA/GPA is not provided in profile")
+            if marks_note and not _is_empty(prof_marks) and have_marks is None:
+                missing.append(f"profile marks value is malformed or invalid: {marks_note}")
+            if cgpa_note and not _is_empty(prof_cgpa) and have_cgpa is None:
+                missing.append(f"profile CGPA value is malformed or invalid: {cgpa_note}")
+        return
+
+    # AND (or a single requirement)
+    if need_marks is not None:
+        if _is_empty(prof_marks):
+            missing.append("academic marks are required but not provided in profile (minimum_marks)")
+        elif have_marks is None:
+            missing.append(f"profile marks value is malformed or invalid: {marks_note}")
+        elif have_marks < need_marks:
+            hard_fails.append(f"Academic marks {have_marks:g} below minimum required {need_marks:g}")
+        else:
+            criteria_passes.append(f"Academic marks {have_marks:g} meet minimum {need_marks:g}")
+
+    if need_cgpa is not None:
+        if _is_empty(prof_cgpa):
+            missing.append("CGPA/GPA is required but not provided in profile (minimum_cgpa)")
+        elif have_cgpa is None:
+            missing.append(f"profile CGPA value is malformed or invalid: {cgpa_note}")
+        elif have_cgpa < need_cgpa:
+            hard_fails.append(f"CGPA {have_cgpa:g} below minimum required {need_cgpa:g}")
+        else:
+            criteria_passes.append(f"CGPA {have_cgpa:g} meets minimum {need_cgpa:g}")
+
+
 def check_eligibility(profile, scholarship, today=None):
     """
     Evaluate whether a student meets a scholarship's eligibility.
 
-    Args:
-        profile (dict): student data
-        scholarship (dict): scholarship record
-        today (date, optional): override "today" (used for deterministic tests)
+    ``scholarship`` may be a raw database row: narrative workbook fields in
+    ``raw_data`` are converted to structured criteria first (see
+    ``src.criteria``).
 
     Returns:
         dict with eligibility_status ('eligible', 'potentially_eligible',
-        'insufficient_information', 'ineligible'), reasons, missing_information.
+        'insufficient_information', 'ineligible'), reasons,
+        missing_information, manual_checks, notes.
     """
     profile = _as_dict(profile)
-    scholarship = _as_dict(scholarship)
+    scholarship = enrich_record(_as_dict(scholarship))
     if today is None:
         today = date.today()
     elif isinstance(today, datetime):
@@ -565,25 +767,17 @@ def check_eligibility(profile, scholarship, today=None):
     hard_fails = []
     criteria_passes = []      # student-specific checks that passed
     availability_passes = []  # status/deadline checks (say nothing about the student)
-
-    def get_any(source, keys):
-        for k in keys:
-            if k in source:
-                return source[k]
-        lowered = {_normalize(sk): sk for sk in source.keys()}
-        for k in keys:
-            if _normalize(k) in lowered:
-                return source[lowered[_normalize(k)]]
-        return None
+    manual_checks = [str(c) for c in (scholarship.get("manual_checks") or []) if str(c).strip()]
+    notes = [str(n) for n in (scholarship.get("criteria_notes") or []) if str(n).strip()]
 
     # --- Nationality ---
-    _check_nationality(get_any(scholarship, ["nationality"]), get_any(profile, ["nationality"]),
+    _check_nationality(get_value(scholarship, ["nationality"]), get_value(profile, ["nationality"]),
                        criteria_passes, hard_fails, missing)
 
     # --- Age ---
-    sch_min_age = get_any(scholarship, ["minimum_age", "min_age"])
-    sch_max_age = get_any(scholarship, ["maximum_age", "max_age"])
-    prof_age = get_any(profile, ["age"])
+    sch_min_age = get_value(scholarship, ["minimum_age", "min_age"])
+    sch_max_age = get_value(scholarship, ["maximum_age", "max_age"])
+    prof_age = get_value(profile, ["age"])
     if not _is_empty(sch_min_age) or not _is_empty(sch_max_age):
         if _is_empty(prof_age):
             missing.append("age is required but not provided in profile")
@@ -604,69 +798,52 @@ def check_eligibility(profile, scholarship, today=None):
 
     # --- Education level / qualification / field ---
     _check_set("education_level",
-               get_any(scholarship, ["education_level", "education level", "level"]),
-               get_any(profile, ["education_level", "education level", "level"]),
+               get_value(scholarship, ["education_level", "education level", "level"]),
+               get_value(profile, ["education_level", "education level", "level"]),
                _canon_edu, _WILDCARDS["education"], criteria_passes, hard_fails, missing,
                "Education level", "education_level")
-    _check_set("qualification", get_any(scholarship, ["qualification"]),
-               get_any(profile, ["qualification"]), _canon_qual, _WILDCARDS["education"],
+    _check_set("qualification", get_value(scholarship, ["qualification"]),
+               get_value(profile, ["qualification"]), _canon_qual, _WILDCARDS["education"],
                criteria_passes, hard_fails, missing, "Qualification", "qualification")
-    prof_field = get_any(profile, ["field_of_study", "field", "discipline", "major", "subject"])
-    _check_field(get_any(scholarship, ["field_of_study", "field", "fields"]), prof_field,
+    prof_field = get_value(profile, ["field_of_study", "field", "discipline", "major", "subject"])
+    _check_field(get_value(scholarship, ["field_of_study", "field", "fields"]), prof_field,
                  criteria_passes, hard_fails, missing)
 
-    # --- Minimum marks (percentage only) ---
-    sch_marks = get_any(scholarship, ["minimum_marks", "min_marks", "minimum_marks_required"])
-    if not _is_empty(sch_marks):
-        prof_marks = get_any(profile, ["marks", "percentage", "marks_percentage"])
-        if _is_empty(prof_marks):
-            missing.append("academic marks are required but not provided in profile (minimum_marks); "
-                           "CGPA cannot be used in place of percentage marks")
-        else:
-            need, need_note = _parse_percentage(sch_marks)
-            have, have_note = _parse_percentage(prof_marks)
-            if need is None:
-                missing.append(f"scholarship minimum_marks criterion malformed or invalid: {need_note}")
-            elif have is None:
-                missing.append(f"profile marks value is malformed or invalid: {have_note}")
-            elif have < need:
-                hard_fails.append(f"Academic marks {have:g} below minimum required {need:g}")
-            else:
-                criteria_passes.append(f"Academic marks {have:g} meet minimum {need:g}")
-
-    # --- Minimum CGPA (4.0 scale only) ---
-    sch_cgpa = get_any(scholarship, ["minimum_cgpa", "min_cgpa", "minimum_gpa", "cgpa"])
-    if not _is_empty(sch_cgpa):
-        prof_cgpa = get_any(profile, ["cgpa", "gpa"])
-        if _is_empty(prof_cgpa):
-            missing.append("CGPA/GPA is required but not provided in profile (minimum_cgpa); "
-                           "percentage marks cannot be used in place of CGPA")
-        else:
-            need, need_note = _parse_cgpa(sch_cgpa)
-            have, have_note = _parse_cgpa(prof_cgpa)
-            if need is None:
-                missing.append(f"scholarship minimum_cgpa criterion malformed or invalid: {need_note}")
-            elif have is None:
-                missing.append(f"profile CGPA value is malformed or invalid: {have_note}")
-            elif have < need:
-                hard_fails.append(f"CGPA {have:g} below minimum required {need:g}")
-            else:
-                criteria_passes.append(f"CGPA {have:g} meets minimum {need:g}")
+    # --- Minimum marks / CGPA (OR alternatives supported) ---
+    _eval_grade_requirement(scholarship, profile, criteria_passes, hard_fails, missing)
 
     # --- Household income ---
-    sch_income = get_any(scholarship, ["household_income_limit", "income_limit", "household_income"])
+    sch_income = get_value(scholarship, ["household_income_limit", "income_limit", "household_income"])
     if not _is_empty(sch_income):
-        prof_income = get_any(profile, ["household_income", "income", "family_income"])
+        prof_income = get_value(profile, ["household_income", "income", "family_income"])
         if _is_empty(prof_income):
             missing.append("household_income is required but not provided in profile")
         else:
             limit, lim_period, lim_note = _parse_income(sch_income)
             have, have_period, have_note = _parse_income(prof_income)
+            if lim_period is None:
+                lim_period = _clean_text(scholarship.get("income_period")) or None
+            if have_period is None:
+                have_period = _clean_text(profile.get("income_period")) or None
             if limit is None:
                 missing.append(f"scholarship household_income_limit criterion malformed or invalid: {lim_note}")
             elif have is None:
                 missing.append(f"profile household_income value is malformed or invalid: {have_note}")
-            elif lim_period != have_period and (lim_period or have_period):
+            elif lim_period and have_period and lim_period != have_period:
+                # Compare on a monthly basis to keep the check useful.
+                factor = {"month": 12, "year": 1}
+                monthly_limit = limit / factor[lim_period]
+                monthly_have = have / factor[have_period]
+                if monthly_have > monthly_limit:
+                    hard_fails.append(
+                        f"Household income {have:g}/{have_period} exceeds limit "
+                        f"{limit:g}/{lim_period}"
+                    )
+                else:
+                    criteria_passes.append(
+                        f"Household income {have:g}/{have_period} within limit {limit:g}/{lim_period}"
+                    )
+            elif lim_period and not have_period:
                 missing.append("household income could not be compared: monthly vs annual period is unclear")
             elif have > limit:
                 hard_fails.append(f"Household income {have:g} exceeds limit {limit:g}")
@@ -674,23 +851,52 @@ def check_eligibility(profile, scholarship, today=None):
                 criteria_passes.append(f"Household income {have:g} within limit {limit:g}")
 
     # --- Geography ---
-    _check_set("province", get_any(scholarship, ["eligible_provinces", "eligible_province", "province"]),
-               get_any(profile, ["province"]), _canon_province, _WILDCARDS["province"],
+    _check_set("province", get_value(scholarship, ["eligible_provinces", "eligible_province", "province"]),
+               get_value(profile, ["province"]), _canon_province, _WILDCARDS["province"],
                criteria_passes, hard_fails, missing, "Province", "province")
-    _check_set("city", get_any(scholarship, ["eligible_cities", "eligible_city", "cities", "city"]),
-               get_any(profile, ["city"]), _canon_exact, _WILDCARDS["city"],
+    _check_set("city", get_value(scholarship, ["eligible_cities", "eligible_city", "cities", "city"]),
+               get_value(profile, ["city"]), _canon_exact, _WILDCARDS["city"],
                criteria_passes, hard_fails, missing, "City", "city")
-    _check_domicile(get_any(scholarship, ["eligible_domiciles", "eligible_domicile", "domiciles", "domicile"]),
-                    get_any(profile, ["domicile"]), criteria_passes, hard_fails, missing)
+
+    # Domicile: use an explicit domicile when given, otherwise fall back to the
+    # student's province (a Sindh student cannot hold a KP domicile). The
+    # fallback is reported in ``notes`` so nothing is silently assumed.
+    sch_dom = get_value(scholarship, ["eligible_domiciles", "eligible_domicile", "domiciles", "domicile"])
+    prof_dom = get_value(profile, ["domicile"])
+    prof_prov = get_value(profile, ["province"])
+    if not _is_empty(sch_dom):
+        if not _is_empty(prof_dom):
+            _check_set("domicile", sch_dom, prof_dom, _canon_domicile, _WILDCARDS["domicile"],
+                       criteria_passes, hard_fails, missing, "Domicile", "domicile")
+        elif not _is_empty(prof_prov):
+            before_fail = len(hard_fails)
+            before_pass = len(criteria_passes)
+            _check_set("domicile", sch_dom, prof_prov, _canon_domicile, _WILDCARDS["domicile"],
+                       criteria_passes, hard_fails, missing, "Domicile", "domicile")
+            if len(hard_fails) > before_fail:
+                notes.append(
+                    "Domicile was assumed to be your province. If you hold the required "
+                    "domicile of another province, update your profile."
+                )
+            elif len(criteria_passes) > before_pass:
+                criteria_passes.append(
+                    f"Domicile requirement ({sch_dom}) matches your province {prof_prov} "
+                    "(add a separate domicile for precision)"
+                )
+        else:
+            missing.append("domicile/province is required but not provided in profile")
 
     # --- Study destination ---
-    _check_set("destination", get_any(scholarship, ["study_destination", "destination"]),
-               get_any(profile, ["study_destination", "destination"]), _canon_destination,
-               _WILDCARDS["destination"], criteria_passes, hard_fails, missing,
-               "Study destination", "study_destination")
+    _check_destination(get_value(scholarship, ["study_destination", "destination"]),
+                       get_value(profile, ["study_destination", "destination"]),
+                       criteria_passes, hard_fails, missing)
+
+    # --- Gender ---
+    _check_gender(get_value(scholarship, ["gender"]), get_value(profile, ["gender"]),
+                  criteria_passes, hard_fails, missing)
 
     # --- Status ---
-    sch_status = get_any(scholarship, ["status"])
+    sch_status = get_value(scholarship, ["status"])
     if not _is_empty(sch_status):
         ns = _clean_text(sch_status)
         if ns in _CLOSED_STATUSES:
@@ -698,12 +904,12 @@ def check_eligibility(profile, scholarship, today=None):
         elif ns in _OPEN_STATUSES:
             availability_passes.append(f"Scholarship status is open: {sch_status}")
         elif ns in _NOT_YET_OPEN_STATUSES:
-            missing.append(f"scholarship is not yet open (status: {sch_status})")
+            missing.append(f"application cycle is not announced yet (status: {sch_status})")
         else:
             missing.append(f"scholarship status '{sch_status}' is not recognised; cannot confirm applications are open")
 
     # --- Deadline ---
-    sch_deadline = get_any(scholarship, ["deadline", "due_date", "closing_date", "last_date"])
+    sch_deadline = get_value(scholarship, ["deadline", "due_date", "closing_date", "last_date"])
     if _is_empty(sch_deadline):
         missing.append("deadline not specified or unknown")
     else:
@@ -722,8 +928,12 @@ def check_eligibility(profile, scholarship, today=None):
     elif missing:
         status = "potentially_eligible" if criteria_passes else "insufficient_information"
         reasons = criteria_passes + availability_passes
+    elif manual_checks:
+        # Everything we can check passed, but the source also has a condition
+        # that only the student can confirm. Never claim full eligibility.
+        status = "potentially_eligible"
+        reasons = criteria_passes + availability_passes
     elif not criteria_passes:
-        # Nothing about the student was actually verified: never claim eligibility.
         status = "insufficient_information"
         reasons = availability_passes
         missing.append("no eligibility criteria are recorded for this scholarship; eligibility cannot be confirmed")
@@ -731,15 +941,20 @@ def check_eligibility(profile, scholarship, today=None):
         status = "eligible"
         reasons = criteria_passes + availability_passes
 
-    seen = set()
-    uniq_missing = []
-    for m in missing:
-        if m not in seen:
-            seen.add(m)
-            uniq_missing.append(m)
-
     return {
         "eligibility_status": status,
-        "reasons": reasons,
-        "missing_information": uniq_missing,
+        "reasons": _dedupe(reasons),
+        "missing_information": _dedupe(missing),
+        "manual_checks": _dedupe(manual_checks),
+        "notes": _dedupe(notes),
+        "blocking_issues": _dedupe(hard_fails),
     }
+
+
+def _dedupe(items):
+    seen, out = set(), []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out

@@ -11,6 +11,9 @@ Key behaviours
   resolve them explicitly with ``column_overrides``.
 * Deduplication never merges records on missing data (see ``_find_duplicate``).
 * Each sheet is imported in one transaction.
+* Narrative columns that stay unmapped here (province_region, minimum_grade,
+  income_threshold, ...) are preserved in ``raw_data`` and converted to
+  structured criteria at match time by ``src.criteria``.
 """
 
 import hashlib
@@ -249,9 +252,9 @@ AMBIGUOUS_HEADERS = {
     "%": ["minimum_marks (requirement)", "the student's achieved marks"],
     "cgpa": ["minimum_cgpa (requirement)", "the student's achieved CGPA"],
     "gpa": ["minimum_cgpa (requirement)", "the student's achieved CGPA"],
-    "minimum grade": ["minimum_marks (percentage)", "minimum_cgpa (grade-point)"],
+    "minimum grade": ["minimum_marks and/or minimum_cgpa (interpreted by src.criteria)"],
     "income": ["household_income_limit", "the applicant's own income"],
-    "income threshold": ["household_income_limit (period and currency unclear)"],
+    "income threshold": ["household_income_limit plus its period (interpreted by src.criteria)"],
     "url": ["application_url", "source_url"],
     "link": ["application_url", "source_url"],
     "website": ["application_url", "source_url"],
@@ -260,8 +263,8 @@ AMBIGUOUS_HEADERS = {
     "origin": ["source_url", "a country/source of origin"],
     "city": ["eligible_cities", "the provider's or institution's city"],
     "province": ["eligible_provinces", "the provider's or institution's province"],
-    "province region": ["eligible_provinces", "location", "a free-text region"],
-    "district": ["eligible_domiciles", "the institution's district"],
+    "province region": ["eligible_provinces (interpreted by src.criteria)", "location", "a free-text region"],
+    "district": ["eligible_cities/districts (interpreted by src.criteria)", "the institution's district"],
     "region": ["eligible_provinces", "location"],
 }
 

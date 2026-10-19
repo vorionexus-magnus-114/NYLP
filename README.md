@@ -1,137 +1,213 @@
-# Scholarship Finder — Backend
+# 🎓 PathFinder AI — Pakistan Scholarship Finder
 
-Python + SQLite backend to help Pakistani students discover scholarships and evaluate
-*indicative* eligibility. Offline, deterministic, no external APIs. Eligibility results are
-guidance only; always confirm with the scholarship's official source.
+An offline-first scholarship discovery dashboard for Pakistani students. It combines a
+curated Excel workbook (147 verified programme records), a deterministic eligibility engine
+and an interactive Streamlit interface.
 
-## Requirements
-- Python 3.9+ (developed and checked on 3.12)
-- `pip install -r requirements.txt` (pandas, openpyxl, pytest)
+**The rule is simple:** a scholarship is only recommended when the recorded criteria can
+actually be checked against the student's profile. A Sindh student never sees a
+Khyber Pakhtunkhwa- or Punjab-only scheme, a bachelor's student never sees a PhD-only
+scheme, and anything the source leaves vague is shown as *"confirm with the sponsor"*
+instead of being silently marked eligible.
 
-## Database
+---
+
+## Quick start
+
 ```bash
-python -c "from src.database import init_db; init_db(); print('Database ready')"
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py
 ```
-- Default file: `data/scholarships.db` (project root); the `data/` folder is created on demand.
-- `init_db()` is idempotent. Schema creation, column migration and index creation run in **one
-  transaction**; if any step fails everything is rolled back and a `RuntimeError` explains why.
-  Existing tables are never dropped or recreated — missing columns (e.g. `external_id`) are added
-  and existing rows are kept.
-- `src.database.get_db_path()` resolves the path. Overriding either `DB_PATH` or the legacy
-  `DATABASE_PATH` is honoured; overriding them to two different places raises an error instead of
-  guessing.
 
-## Importing a workbook
+The app opens at <http://localhost:8501>. The database (`scholarships.db`) is committed,
+so the first launch is instant; if it is missing it is rebuilt from
+`Pakistan_Scholarship_Finder_Master.xlsx`.
+
+Optional AI assistant:
+
+```bash
+export GEMINI_API_KEY=...          # see env.example
+```
+
+Without a key the assistant still works using deterministic, database-grounded replies.
+
+Tests:
+
+```bash
+python -m pytest -q
+python -m compileall -q src app.py
+```
+
+---
+
+## What the app does
+
+### 🏠 Dashboard
+* Live metrics: **eligible now**, **likely eligible**, **needs information**, **filtered out**.
+* Every widget in the sidebar updates the results immediately (there is no "reload" step).
+* Charts for the eligibility split and where the matches are.
+* Result cards with:
+  * the exact criteria that passed (✅) and the ones that blocked the record (❌),
+  * what is still unknown (⚠️) and what must be confirmed with the sponsor (🔎),
+  * recorded requirements (level, province/domicile, grades, income, age, field, destination),
+  * provenance (verification status, last checked, source publisher, evidence excerpt),
+  * apply/source links and a save button.
+* Optional "show scholarships I am **not** eligible for" mode with the blocking reason.
+
+### 🔎 All Scholarships
+Searchable and filterable catalogue of every record, with a `Your eligibility` column,
+official links, CSV export and a full record detail panel.
+
+### 🤖 Assistant
+Scholarship-only chat. It extracts province, degree level, percentage/CGPA, field, age and
+destination from natural language, updates the profile, and answers from the database only.
+It never recommends an ineligible record and never invents deadlines or URLs.
+
+### 👤 Profile
+Full editable profile: education level, percentage **or** CGPA, field of study, province,
+domicile, city, destination, age, gender, household income and its period, English test.
+Both grading systems have their own input — switching between them reveals the matching
+field (this was the old broken behaviour, now covered by tests).
+
+### 🛡️ Data Health
+Cross-checks the workbook itself:
+* expired-but-open deadlines, open-without-deadline, closed-with-future-deadline,
+* records not marked `confirmed` by the source review,
+* stale verification dates, missing/invalid source URLs,
+* grade or income rules that could not be converted,
+* duplicate external ids and nationwide records with a domicile rule,
+* full provenance table and CSV export,
+* optional live re-verification with Gemini Search when a key is configured.
+
+---
+
+## How eligibility works
+
+`src/criteria.py` converts the workbook's prose columns into structured criteria, and
+`src/eligibility.py` evaluates them.
+
+### Province and domicile
+`province_region` is the primary source (`All Pakistan` = nationwide, otherwise the named
+provinces). `domicile_rule` and `geographic_scope` are used when they contain a province
+or when the scope is nationwide but a domicile is required.
+
+* A province mismatch is a **hard fail** — this is what removes KP/Punjab schemes from a
+  Sindh student's dashboard.
+* Domicile is compared with the student's domicile when given. If it is not given, the
+  province is used as a proxy and the assumption is reported in the result (`notes`) so it
+  is never hidden.
+* District lists (e.g. a Balochistan scheme targeting 11 districts) are matched against the
+  student's city/district; a missing city is reported as unknown, not as a pass.
+
+### Education level
+`study_level` is parsed into a set of supported levels
+(`matric`, `intermediate`, `vocational`, `bachelor`, `master`, `phd`):
+
+* `"Nursery through BS"` → matric, intermediate, bachelor
+* `"MS / MPhil / PhD (inland)"` → master, PhD
+* `"Intermediate / DAE"` → intermediate, vocational
+* `"Postdoctoral / lectureship"` → PhD (a bachelor's student is therefore excluded)
+* Unparseable level descriptions (e.g. `"Research fellowship"`) stay unknown and produce a
+  manual check instead of a guess.
+
+### Grades
+`minimum_grade` prose such as `"At least 60% or 3.0 GPA/CGPA"` becomes
+`minimum_marks=60`, `minimum_cgpa=3.0`, `grade_logic="or"`.
+
+* `or` means either path can satisfy the requirement; it fails only when **both** known
+  values fail, and stays unknown when one side is missing.
+* Percentage and CGPA are never converted into one another.
+* `"85%"`, `"85 percent"`, `"900/1100"` are accepted from chat; the UI uses numeric inputs.
+
+### Income
+`income_threshold` is parsed into an amount plus a period (`month`/`year`, including
+`PKR 1.5m`). Monthly and annual values are compared on a normalised monthly basis when the
+student supplies a period; without one the comparison is reported as unknown.
+
+### Field of study
+`fields_of_study` is compared using field groups (computing, engineering, health, business,
+law, environment, earth, media, design, education, science, arts, social):
+
+* `"IT, engineering, medicine, business administration"` is an inclusive list → any
+  recognised field matches.
+* `"Cybersecurity"` matches Computer Science; `"European Forestry"` does not.
+* Vague prose (`"Partner-specified eligible fields"`) stays unknown.
+
+### Destination
+The workbook's `destination_country` is used; when blank it is inferred from the record
+(`Erasmus Mundus`/consortium → international, `overseas` in the name → international,
+`.pk` source + local sponsor → Pakistan). A student who chooses **Abroad** is only shown
+non-Pakistan opportunities, and vice versa. **Any** applies no destination filter.
+
+### Everything else
+* **Status:** `open`, `rolling`, `active`, `ongoing` count as open; `not_announced` is shown
+  as "cycle not announced yet"; `closed`/`expired` are ineligible.
+* **Deadline:** ISO, `dd/mm/yyyy`, `15 June 2031`, `June 15, 2031`, datetimes. Expired
+  deadlines are ineligible; a deadline of today is still open.
+* **Gender:** machine-checked when the source restricts it and the profile provides it.
+* **Manual checks:** target beneficiary groups, employment conditions, language tests and
+  similar source-only conditions never grant `eligible`; they cap the status at
+  `potentially_eligible` until the student confirms.
+
+### Status meanings
+
+| Status | Meaning |
+| --- | --- |
+| `eligible` | Every recorded student criterion passed, and the cycle is open. |
+| `potentially_eligible` | Criteria passed but something must be confirmed (unannounced cycle, missing deadline, manual condition). |
+| `insufficient_information` | The profile or the source is missing data; nothing can be confirmed. |
+| `ineligible` | A hard criterion failed (province, domicile, level, grade, income, field, destination, gender, status, deadline). |
+
+---
+
+## Project layout
+
+```
+app.py                               Streamlit UI (dashboard, catalogue, chat, profile, data health)
+src/
+  criteria.py                        prose → structured criteria (province, level, grade, income, field…)
+  eligibility.py                     deterministic eligibility engine
+  matching.py                        database evaluation, enrichment, ranking
+  profile.py                          profile normalisation + natural-language extraction
+  database.py                        schema, migrations, connection, seeding
+  data_import.py                     workbook import (dedup, transactions, raw_data preservation)
+  data_quality.py                    provenance / consistency audit
+  ai_agent.py                        optional Gemini assistant + offline fallback
+  scholarship_chat.py                topic guardrails and intent classification
+  web_verification.py                optional cached Gemini source verification
+scholarships.db                      SQLite database (147 records)
+Pakistan_Scholarship_Finder_Master.xlsx
+tests/                               pytest suite (criteria, eligibility, profile, matching, UI smoke)
+```
+
+## Data model
+
+Every workbook row is kept verbatim in `raw_data` (JSON) in addition to the canonical
+columns. The derived criteria are computed from `raw_data` at match time, so improving the
+rules automatically improves every existing record without a re-import.
+
+## Importing a newer workbook
+
 ```python
 from src.data_import import import_workbook
 
 result = import_workbook("path/to/workbook.xlsx")
-# optional: resolve an ambiguous header yourself
-result = import_workbook("path/to/workbook.xlsx", column_overrides={"Country": "study_destination"})
+print(result["records_inserted"], result["errors"], result["warnings"])
 ```
-`result` keys: `records_inserted`, `records_skipped`, `records_duplicate`, `records_incomplete_key`,
-`sheets_processed`, `errors`, `warnings`. **Check `errors` and `warnings` after every import.**
 
-- The workbook is opened read-only and never modified. Every source row is kept in `raw_data` (JSON).
-- **Header row detection:** the header may be below title rows (first 15 rows scanned; the first row
-  with ≥2 recognised headers wins). A warning reports where it was found.
-- **Ambiguous headers are not mapped.** `Country, State, Marks, Percentage, CGPA, GPA, Income, URL,
-  Link, Website, City, Province, District, Region, Source, Reference, Origin` (and the 60-field
-  headers `minimum_grade`, `income_threshold`, `province_region`) stay unmapped: values are preserved
-  in `raw_data` and a warning lists what they could mean. Explicit headers such as
-  `Study Destination`, `Minimum CGPA`, `Minimum Marks`, `Application URL`, `Source URL`,
-  `Eligible Provinces`, `Household Income Limit` map normally. Use `column_overrides` to decide an
-  ambiguous header yourself (target must be a canonical field; otherwise an error is returned and
-  nothing is imported).
-- Generic-but-reasonable headers (`Level`, `Amount`, `Destination`, …) still map with a warning.
-- Metadata sheets (contents/index/summary, `START_HERE`, dictionary, exclusions, verify queue,
-  region index) are skipped.
-- **Deduplication** (missing data never merges records):
-  1. same `external_id` (workbook ID such as `opportunity_id`) ⇒ duplicate; different IDs ⇒ always distinct;
-  2. complete key `name + provider + deadline` (deadline must parse; formats are normalised) ⇒ duplicate;
-     a different deadline is a different cycle;
-  3. key incomplete (no provider, or missing/unparseable deadline) ⇒ duplicate **only** if every
-     imported field and the raw source row are identical (an exact re-import); otherwise inserted as a
-     distinct record and counted in `records_incomplete_key` (with a warning).
-  If the duplicate check itself fails, the row is **not inserted** and an error is reported.
-- **Transactions:** each sheet is imported in one transaction. An unexpected failure rolls that sheet
-  back completely (nothing from it is kept or counted) and adds an error; other sheets are unaffected.
-  A single row whose INSERT fails is reported in `errors` and not counted.
-
-## Eligibility
-```python
-from src.eligibility import check_eligibility
-r = check_eligibility(profile, scholarship)            # optional: today=date(...) for tests
-# {"eligibility_status": "eligible|potentially_eligible|insufficient_information|ineligible",
-#  "reasons": [...], "missing_information": [...]}
-```
-Principle: a criterion **fails** only when both sides are clearly understood. Anything ambiguous,
-unrecognised or malformed is *unknown* and goes to `missing_information`; it never counts as a pass.
-
-- `eligible` needs at least one verified, student-specific criterion and nothing unknown. A scholarship
-  with **no recorded criteria** is `insufficient_information`, never `eligible`. An open status or
-  future deadline alone does not make a student `potentially_eligible`.
-- **Marks vs CGPA:** `marks`/`percentage` are compared only with `minimum_marks`; `cgpa`/`gpa` only with
-  `minimum_cgpa`. No conversion. Percentage accepts `75`, `75%`, `850/1100`; a value that looks like a
-  GPA (≤4.5, or `x/4`) in a marks field is unknown. CGPA is accepted on a 4.0 scale only; `85`, `3.5/5`
-  or `4.5` are unknown. Raw obtained marks without a total (e.g. `850`) are unknown.
-- **Nationality:** `Pakistani`, `Pakistan`, `PK`, `Pakistani national/citizen` are equivalent. Qualified
-  forms (`Overseas Pakistani`, `Dual …`) are unknown. A mismatch is declared only when Pakistan is on
-  one side and the other side is a plain, different value. `All`/`Any nationality` = unrestricted.
-- **Education / qualification:** conservative aliases only (`BS, BSc, BA, BBA, Bachelors, Undergraduate`
-  → bachelor; `MS, MSc, MA, Masters` → master; `PhD, Doctorate`; `FSc, FA, ICS, HSSC, A Level`
-  → intermediate; `Matric, SSC, O Level`). **Not aliased:** `Postgraduate`, `Graduate`, `PG`, `MPhil`
-  (as a level), associate/diploma — these stay unknown. Parenthetical text is ignored (`FSc (Pre-Medical)`).
-- **Geography:** province aliases (`KPK/KP/Khyber Pakhtunkhwa`, `Baluchistan`, `AJK/Azad Kashmir`,
-  `GB`, `ICT/Islamabad`). Domicile is **never inferred from province**; a district compared with a
-  province is unknown. `All Pakistan`/`Nationwide` = unrestricted. Destinations: `USA/US/United States`,
-  `UK/United Kingdom`, `KSA`, `UAE`, `Turkey/Turkiye`; `England`, `America`, `Britain`, `Aus`,
-  `Emirates` are **not** aliased; regions such as `Europe` are unknown.
-- **Income:** PKR amounts (`Rs. 50,000`, `50,000/-`). Monthly-vs-annual mismatch or a non-PKR currency
-  is unknown.
-- **Status:** `open/active/available/ongoing` pass; `closed/expired/…` fail; `upcoming`, `not_announced`,
-  `unknown`, `pending`, anything unrecognised is unknown (never eligible).
-- **Deadline:** parsed ISO, `dd/mm/yyyy`, `15 June 2031`, `June 15, 2031`, `15th June 2031`, datetimes.
-  Ambiguous (`03/04/2031`), multi-date (`open … close …`), `TBA`/`Rolling`, impossible dates are unknown.
-  A deadline of today is still open; past is `ineligible`; missing is unknown.
-
-## Matching
-```python
-from src.matching import find_matches
-matches = find_matches({"age": 20, "province": "Punjab", "marks": 80}, limit=50)   # today=... optional
-```
-Each item has: `id, name, provider, description, education_level, location, funding, deadline, status,
-application_url, source_url, verified_at, eligibility_status, reasons, missing_information,
-record_type, diagnostics`.
-
-- `record_type == "scholarship"`: a real record. `diagnostics` lists problems evaluating it (e.g. the
-  eligibility check raised) — such a record is `insufficient_information`, not hidden.
-- `record_type == "error"`: placeholder for a row that could not be read. `eligibility_status` is
-  `"error"`, scholarship fields are `None`, `error`/`diagnostics` explain. Error items come **after**
-  real results and do not count toward `limit`. Filter on `record_type` in your UI.
-- Ranking: `eligible` > `potentially_eligible` > `insufficient_information`; then earliest parsed deadline
-  (missing/unparseable last); then id. `ineligible` records are excluded.
-- `limit` is clamped to 1–500; invalid values (0, negative, text, bool) fall back to 50.
-- A `None`/non-mapping profile is treated as empty (every result is then unknown, never eligible).
-- **Database failures are never turned into `[]`:** initialisation, connection and query errors raise
-  `RuntimeError`. An empty list means the table really has no eligible/unknown rows.
-
-## Tests
-```bash
-python -m pytest -q
-python -m compileall -q src tests
-```
-- 247 tests in `tests/` (parametrised cases counted individually). `tests/conftest.py` redirects every
-  test to a temporary SQLite file and fails any test that creates or changes `data/scholarships.db`.
-  Tests use synthetic workbooks only; none reads or writes your real database or workbook.
+The importer skips TOC/metadata sheets, detects the real header row, deduplicates on
+`external_id` and on `name + provider + deadline`, and imports each sheet in one
+transaction. Ambiguous headers stay unmapped but are preserved in `raw_data` and consumed
+by `src/criteria.py`.
 
 ## Known limitations
-- Narrative rules in curated workbooks (e.g. `nationality_rule`, `domicile_rule`, `other_eligibility`,
-  `minimum_grade`, `income_threshold`) are **not** converted to structured criteria; imported records
-  carry them in `raw_data` only, so matching reports those criteria as unknown.
-- Field of study is compared as text (exact; partial overlap is unknown). No synonym handling.
-- Dedup is application-level (no UNIQUE constraint); concurrent importers are serialised by SQLite's
-  write lock, but the database does not itself forbid duplicates.
-- Re-importing a workbook whose rows changed *and* have an incomplete key inserts the changed rows as new
-  records (only exact repeats are skipped).
-- Not eligibility advice; no scraping, no authentication, no network access.
+
+* Eligibility is **indicative**. Always confirm on the sponsor's page.
+* 112 of 147 records have no confirmed deadline yet (the next cycle is not announced);
+  they are shown as "likely eligible"/"needs information", never as "eligible now".
+* Field-of-study matching is a curated synonym system, not semantic understanding.
+* A domicile rule is compared with the province when no separate domicile is entered.
+* Live source re-verification requires `GEMINI_API_KEY`; without it only the workbook's own
+  provenance is shown.

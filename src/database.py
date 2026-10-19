@@ -1,16 +1,17 @@
 """
 Database module for Scholarship Finder.
 
-Provides SQLite storage at data/scholarships.db relative to project root.
+Stores the SQLite database next to the application (``scholarships.db`` in the
+repository root) and seeds it from the bundled master workbook when empty.
 """
 
 import sqlite3
 from pathlib import Path
 
-# Project root is parent of src directory
+# Project root is the parent of this ``src`` package.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "scholarships.db"
+DATA_DIR = PROJECT_ROOT
+DB_PATH = PROJECT_ROOT / "scholarships.db"
 # Kept for backward compatibility with older tests that patch this name.
 # get_db_path() honours it, so patching either name can never silently fall
 # through to the real database.
@@ -205,7 +206,11 @@ def seed_database_if_empty(workbook_path=None):
     from the default or specified Excel workbook.
     """
     if workbook_path is None:
-        workbook_path = DATA_DIR / "Pakistan_Scholarship_Finder_Master.xlsx"
+        candidates = [
+            PROJECT_ROOT / "Pakistan_Scholarship_Finder_Master.xlsx",
+            PROJECT_ROOT / "data" / "Pakistan_Scholarship_Finder_Master.xlsx",
+        ]
+        workbook_path = next((c for c in candidates if c.exists()), candidates[0])
 
     p = Path(workbook_path)
     if not p.exists():
